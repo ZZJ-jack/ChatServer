@@ -1,0 +1,14 @@
+# wrangler.toml
+name = "chatserver"
+main = "src/index.js"
+compatibility_date = "2024-11-12"
+
+# 绑定 Durable Object
+[[durable_objects.bindings]]
+name = "CHAT_ROOM"
+class_name = "ChatRoom"
+
+# 指示 Wrangler 导出名为 "ChatRoom" 的 Durable Object 类
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatRoom"]
