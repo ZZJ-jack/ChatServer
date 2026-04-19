@@ -51,11 +51,16 @@ export class ChatRoom {
     this.ctx = state;
     this.sessions = new Map();        // clientId -> { ws, username, initialized, lastHeartbeat }
     this.usernames = new Set();
+    this.alarmRunning = false;        // 防止重复设置 Alarm
   }
 
+  // 处理 HTTP 请求（检查用户名，同时清理僵尸连接）
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === '/check' && request.method === 'POST') {
+      // 先清理可能存在的僵尸连接（已断开但未触发 close 事件）
+      await this.cleanupDeadConnections();
+
       const { username } = await request.json();
       const nameRegex = /^[a-zA-Z0-9\u4e00-\u9fa5]{2,12}$/;
       if (!username || !nameRegex.test(username)) {
@@ -77,11 +82,30 @@ export class ChatRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // 清理已断开的连接（基于 WebSocket.readyState）
+  async cleanupDeadConnections() {
+    const toRemove = [];
+    for (const [clientId, session] of this.sessions.entries()) {
+      try {
+        // 检查 WebSocket 是否仍然打开 (readyState 1 = OPEN)
+        if (session.ws.readyState !== 1) {
+          toRemove.push(clientId);
+        }
+      } catch (e) {
+        // 如果访问 readyState 抛出异常，说明连接已无效
+        toRemove.push(clientId);
+      }
+    }
+
+    for (const clientId of toRemove) {
+      await this.cleanupClient(clientId, false); // 静默清理，不广播离开消息
+    }
+  }
+
   async webSocketOpen(ws) {
     const clientId = this.ctx.getTags(ws)[0];
     this.sessions.set(clientId, { ws, username: null, initialized: false, lastHeartbeat: Date.now() });
-    // 启动心跳检查 Alarm（如果尚未启动）
-    await this.ensureHeartbeatAlarm();
+    await this.ensureAlarm();
   }
 
   async webSocketMessage(ws, message) {
@@ -115,6 +139,7 @@ export class ChatRoom {
           return;
         }
 
+        // 再次检查用户名是否已被占用（防止 race condition）
         if (this.usernames.has(username)) {
           ws.send(JSON.stringify({ type: 'error', code: 'DUPLICATE_NAME', message: '用户名已被占用' }));
           ws.close(1000, 'Duplicate username');
@@ -133,7 +158,7 @@ export class ChatRoom {
           timestamp: Date.now()
         }, clientId);
 
-        await this.state.storage.deleteAlarm(); // 房间有人，取消自动销毁 Alarm
+        // 房间有人，取消可能存在的自动销毁 Alarm（但保留心跳检查 Alarm）
         return;
       }
 
@@ -163,16 +188,17 @@ export class ChatRoom {
 
   async webSocketClose(ws, code, reason, wasClean) {
     const clientId = this.ctx.getTags(ws)[0];
-    await this.cleanupClient(clientId);
+    await this.cleanupClient(clientId, true);
   }
 
   async webSocketError(ws, error) {
     const clientId = this.ctx.getTags(ws)[0];
     console.error('WebSocket error for', clientId, error);
-    await this.cleanupClient(clientId);
+    await this.cleanupClient(clientId, true);
   }
 
-  async cleanupClient(clientId) {
+  // 清理单个客户端
+  async cleanupClient(clientId, broadcastLeave = true) {
     const session = this.sessions.get(clientId);
     if (!session) return;
 
@@ -180,48 +206,61 @@ export class ChatRoom {
     this.sessions.delete(clientId);
     if (initialized && username) {
       this.usernames.delete(username);
-      await this.broadcast({
-        type: 'system',
-        content: `🚪 ${username} 离开了房间`,
-        timestamp: Date.now()
-      });
+      if (broadcastLeave) {
+        await this.broadcast({
+          type: 'system',
+          content: `🚪 ${username} 离开了房间`,
+          timestamp: Date.now()
+        });
+      }
     }
 
-    // 如果房间空了，设置 30 秒后自动销毁
+    // 如果房间空了，设置 30 秒后自动销毁（注意：此时应取消心跳 Alarm，改用销毁 Alarm）
     if (this.sessions.size === 0) {
-      await this.state.storage.setAlarm(Date.now() + 30000);
+      await this.state.storage.deleteAlarm(); // 清除现有 Alarm
+      await this.state.storage.setAlarm(Date.now() + 30000); // 30 秒后销毁
+      this.alarmRunning = false;
     }
   }
 
-  // 心跳检查：清理超时连接（30 秒无心跳）
-  async ensureHeartbeatAlarm() {
-    // 每 30 秒执行一次清理
-    const existing = await this.state.storage.getAlarm();
-    if (!existing) {
-      await this.state.storage.setAlarm(Date.now() + 30000);
+  // 确保心跳检查 Alarm 在运行
+  async ensureAlarm() {
+    if (this.sessions.size > 0) {
+      const existing = await this.state.storage.getAlarm();
+      if (!existing) {
+        await this.state.storage.setAlarm(Date.now() + 25000); // 25 秒后检查心跳
+        this.alarmRunning = true;
+      }
     }
   }
 
   async alarm() {
     const now = Date.now();
-    const timeout = 35000; // 35 秒无心跳视为断开
+    const heartbeatTimeout = 20000; // 20 秒无心跳视为断开
 
-    // 清理心跳超时的连接
+    // 检查心跳超时的连接
+    const toRemove = [];
     for (const [clientId, session] of this.sessions.entries()) {
-      if (now - session.lastHeartbeat > timeout) {
-        try {
-          session.ws.close(1001, 'Heartbeat timeout');
-        } catch (e) {}
-        await this.cleanupClient(clientId);
+      if (now - session.lastHeartbeat > heartbeatTimeout) {
+        toRemove.push(clientId);
       }
     }
 
-    if (this.sessions.size === 0) {
-      // 房间无人，彻底销毁
-      await this.ctx.storage.deleteAll();
-      await this.ctx.storage.deleteAlarm();
+    for (const clientId of toRemove) {
+      const session = this.sessions.get(clientId);
+      if (session) {
+        try {
+          session.ws.close(1001, 'Heartbeat timeout');
+        } catch (e) {}
+        await this.cleanupClient(clientId, true);
+      }
+    }
+
+    // 如果房间仍有人，继续下一次心跳检查；否则设置销毁 Alarm
+    if (this.sessions.size > 0) {
+      await this.state.storage.setAlarm(Date.now() + 25000);
     } else {
-      // 仍有连接，继续下一次心跳检查
+      // 房间无人，设置 30 秒后销毁（与 cleanupClient 中逻辑一致）
       await this.state.storage.setAlarm(Date.now() + 30000);
     }
   }
