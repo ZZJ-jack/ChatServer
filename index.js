@@ -28,8 +28,8 @@ export class ChatRoom {
     this.state = state;
     this.env = env;
     this.ctx = state;
-    this.sessions = new Map();        // clientId -> { ws, username }
-    this.usernames = new Set();       // 房间内已用用户名
+    this.sessions = new Map();        // clientId -> { ws, username, initialized }
+    this.usernames = new Set();
   }
 
   async fetch(request) {
@@ -40,10 +40,6 @@ export class ChatRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketOpen(ws) {
-    // 连接打开后等待客户端发送 init 消息
-  }
-
   async webSocketMessage(ws, message) {
     const clientId = this.ctx.getTags(ws)[0];
 
@@ -52,6 +48,17 @@ export class ChatRoom {
 
       // 处理初始化消息（设置用户名）
       if (data.type === 'init') {
+        const session = this.sessions.get(clientId);
+        // 防止重复初始化
+        if (session && session.initialized) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: 'ALREADY_INIT',
+            message: '连接已初始化'
+          }));
+          return;
+        }
+
         const username = data.username?.trim();
         const nameRegex = /^[a-zA-Z0-9\u4e00-\u9fa5]{2,12}$/;
 
@@ -75,11 +82,11 @@ export class ChatRoom {
           return;
         }
 
-        // 保存会话
-        this.sessions.set(clientId, { ws, username });
+        // 保存会话，标记已初始化
+        this.sessions.set(clientId, { ws, username, initialized: true });
         this.usernames.add(username);
 
-        // 发送欢迎消息给该用户
+        // 发送欢迎消息给该用户（仅自己可见）
         ws.send(JSON.stringify({
           type: 'system',
           content: `🎉 欢迎 ${username} 加入房间`,
@@ -93,7 +100,7 @@ export class ChatRoom {
           timestamp: Date.now()
         }, clientId);
 
-        // 取消可能存在的 Alarm（房间现在有活跃用户）
+        // 取消可能存在的 Alarm
         await this.state.storage.deleteAlarm();
         return;
       }
@@ -101,21 +108,26 @@ export class ChatRoom {
       // 处理普通聊天消息
       if (data.type === 'message') {
         const session = this.sessions.get(clientId);
-        if (!session) return;
+        if (!session || !session.initialized) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: 'NOT_INIT',
+            message: '请先设置用户名'
+          }));
+          return;
+        }
 
         const payload = {
           type: 'message',
           clientId: clientId,
           username: session.username,
           content: data.content,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          tempId: data.tempId // 回传临时ID
         };
 
-        // 可选：存储消息
         await this.state.storage.put(`msg:${payload.timestamp}`, payload);
-
-        // 广播给所有人（包括自己）
-        await this.broadcast(payload);
+        await this.broadcast(payload); // 广播给所有人（包括自己）
       }
     } catch (e) {
       console.error('消息处理错误:', e);
@@ -149,7 +161,6 @@ export class ChatRoom {
   }
 
   async alarm() {
-    // 当 Alarm 触发时，若仍无连接，则删除 Durable Object 实例
     if (this.sessions.size === 0) {
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
@@ -163,7 +174,7 @@ export class ChatRoom {
       try {
         session.ws.send(messageStr);
       } catch (e) {
-        // 发送失败忽略
+        // 忽略发送失败
       }
     }
   }
