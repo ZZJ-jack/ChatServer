@@ -1,6 +1,6 @@
 # wrangler.toml
 name = "chatserver"
-main = "index.js"
+main = "src/index.js"
 compatibility_date = "2024-11-12"
 
 # 绑定 Durable Object
