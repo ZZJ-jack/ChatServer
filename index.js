@@ -1,93 +1,87 @@
 // src/index.js
 
-// --- Worker 入口逻辑 ---
 export default {
   async fetch(request, env) {
-    // 1. 解析请求 URL，获取房间名称
     const url = new URL(request.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
 
-    // 期望的路径格式：/room/:roomName
-    if (pathSegments.length === 0 || pathSegments[0] !== 'room') {
-      return new Response('Not Found. Please connect to /room/:roomName', { status: 404 });
+    // 仅处理 /room/:roomName 的 WebSocket 升级请求
+    if (pathSegments.length >= 2 && pathSegments[0] === 'room') {
+      const roomName = pathSegments[1];
+
+      // 检查是否为 WebSocket 升级请求
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        // 非 WebSocket 请求（例如浏览器地址栏访问），返回简单文本
+        return new Response('ChatServer is running', {
+          headers: { 'Content-Type': 'text/plain' },
+        });
+      }
+
+      // 处理 WebSocket 连接
+      const id = env.CHAT_ROOM.idFromName(roomName);
+      const roomObject = env.CHAT_ROOM.get(id);
+      return roomObject.fetch(request);
     }
 
-    const roomName = pathSegments[1] || 'default-room';
-
-    // 2. 检查是否为 WebSocket 升级请求
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      // 如果只是普通 HTTP 请求，返回简单的 HTML 页面，方便测试
-      return new Response(
-        `<html>
-          <body>
-            <h1>Cloudflare Chat Room: ${roomName}</h1>
-            <p>Connect via WebSocket to: wss://${url.host}/room/${roomName}</p>
-            <p>You can use the browser console or a WebSocket client to connect.</p>
-            <script>
-              // 一个非常简单的浏览器内测试客户端
-              const room = '${roomName}';
-              const ws = new WebSocket(\`wss://\${location.host}/room/\${room}\`);
-              ws.onopen = () => console.log('Connected!');
-              ws.onmessage = (e) => console.log('Received:', e.data);
-              ws.onclose = () => console.log('Disconnected');
-              window.send = (msg) => ws.send(msg);
-              console.log('Use send("your message") to chat.');
-            </script>
-          </body>
-        </html>`,
-        { headers: { 'Content-Type': 'text/html' } }
-      );
-    }
-
-    // 3. 处理 WebSocket 升级请求
-    // 获取 Durable Object 的 ID（每个房间名对应一个唯一的 ID）
-    const id = env.CHAT_ROOM.idFromName(roomName);
-    // 获取该 ID 对应的 Durable Object 存根
-    const roomObject = env.CHAT_ROOM.get(id);
-
-    // 将请求转发给 Durable Object 的 fetch 方法处理
-    return roomObject.fetch(request);
+    // 其他路径返回 404 或同样显示运行状态
+    return new Response('ChatServer is running', {
+      status: 200,
+      headers: { 'Content-Type': 'text/plain' },
+    });
   },
 };
 
-// --- Durable Object 类：ChatRoom ---
+// Durable Object 类：聊天室
 export class ChatRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // 使用 this.ctx 访问 WebSocket Hibernation API
-    this.ctx = state; 
-    // 存储 WebSocket 连接信息，用于休眠/唤醒时的状态管理
-    this.sessions = new Map();
+    this.ctx = state; // 用于 Hibernation API
   }
 
   async fetch(request) {
-    // 从请求中提取 WebSocket
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
-    // 为该连接生成唯一的客户端 ID
+    // 为每个连接生成唯一 ID
     const clientId = crypto.randomUUID();
-    
-    // 使用 Hibernation API 接受 WebSocket 连接
+
+    // 接受 WebSocket 连接，并附带 clientId 作为标签
     this.ctx.acceptWebSocket(server, [clientId]);
 
-    // 返回 101 Switching Protocols 响应，并带上客户端的 WebSocket
     return new Response(null, {
       status: 101,
       webSocket: client,
     });
   }
 
-  // --- WebSocket Hibernation API 处理函数 ---
-  
-  // 当新的 WebSocket 连接被 acceptWebSocket 接受时调用
-  async webSocketMessage(ws, message) {
-    // 获取该连接对应的元数据（客户端 ID）
+  // 当 WebSocket 连接建立时触发（可选）
+  async webSocketOpen(ws) {
     const clientId = this.ctx.getTags(ws)[0];
-    
+    // 向该客户端发送欢迎消息（包含其 clientId）
+    ws.send(
+      JSON.stringify({
+        type: 'system',
+        content: `已连接至聊天室，你的 ID 是 ${clientId.slice(0, 6)}`,
+        clientId: clientId,
+        timestamp: Date.now(),
+      })
+    );
+
+    // 广播加入消息
+    const joinMsg = {
+      type: 'system',
+      content: `用户 ${clientId.slice(0, 6)} 加入了房间`,
+      timestamp: Date.now(),
+    };
+    await this.broadcast(joinMsg);
+  }
+
+  // 收到客户端消息
+  async webSocketMessage(ws, message) {
+    const clientId = this.ctx.getTags(ws)[0];
+
     try {
-      // 解析客户端发送的消息
       const data = JSON.parse(message);
       const payload = {
         type: data.type || 'message',
@@ -96,53 +90,44 @@ export class ChatRoom {
         timestamp: Date.now(),
       };
 
-      // 如果是聊天消息，存储到 Durable Object 的持久化存储中
+      // 仅存储普通聊天消息（可选，用于历史记录）
       if (payload.type === 'message') {
         await this.state.storage.put(`msg:${payload.timestamp}`, payload);
       }
 
-      // 将消息广播给房间内所有其他用户
+      // 广播给所有连接的客户端
       await this.broadcast(payload);
     } catch (e) {
-      console.error('Error processing message:', e);
+      console.error('消息解析失败:', e);
     }
   }
 
-  // 当 WebSocket 连接关闭时调用
+  // 连接关闭
   async webSocketClose(ws, code, reason, wasClean) {
     const clientId = this.ctx.getTags(ws)[0];
-    // 广播“用户离开”的系统消息
-    const leaveMessage = {
+    const leaveMsg = {
       type: 'system',
-      content: `User ${clientId} left the room.`,
+      content: `用户 ${clientId.slice(0, 6)} 离开了房间`,
       timestamp: Date.now(),
     };
-    await this.broadcast(leaveMessage);
+    await this.broadcast(leaveMsg);
   }
 
-  // 当 WebSocket 连接发生错误时调用
+  // 连接错误
   async webSocketError(ws, error) {
     console.error('WebSocket error:', error);
   }
 
-  // --- 辅助函数：广播消息 ---
+  // 广播辅助函数
   async broadcast(payload) {
-    // 获取当前 Durable Object 实例管理的所有 WebSocket 连接
     const sockets = this.ctx.getWebSockets();
-    
     const messageStr = JSON.stringify(payload);
-    
-    // 向所有已连接的 WebSocket 发送消息
     for (const socket of sockets) {
       try {
         socket.send(messageStr);
       } catch (e) {
-        console.error('Failed to send to socket:', e);
-        // 如果发送失败，可以在这里记录并考虑清理连接
+        // 发送失败（可能连接已断开），忽略
       }
     }
   }
-
-  // 注意：我们没有显式定义 webSocketOpen，因为使用了 Hibernation API 后，
-  // 连接在休眠唤醒后会自动重建，无需手动管理。
 }
