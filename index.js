@@ -1,29 +1,22 @@
-// src/index.js
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
 
-    // 仅处理 /room/:roomName 的 WebSocket 升级请求
     if (pathSegments.length >= 2 && pathSegments[0] === 'room') {
       const roomName = pathSegments[1];
 
-      // 检查是否为 WebSocket 升级请求
       if (request.headers.get('Upgrade') !== 'websocket') {
-        // 非 WebSocket 请求（例如浏览器地址栏访问），返回简单文本
         return new Response('ChatServer is running', {
           headers: { 'Content-Type': 'text/plain' },
         });
       }
 
-      // 处理 WebSocket 连接
       const id = env.CHAT_ROOM.idFromName(roomName);
       const roomObject = env.CHAT_ROOM.get(id);
       return roomObject.fetch(request);
     }
 
-    // 其他路径返回 404 或同样显示运行状态
     return new Response('ChatServer is running', {
       status: 200,
       headers: { 'Content-Type': 'text/plain' },
@@ -31,22 +24,18 @@ export default {
   },
 };
 
-// Durable Object 类：聊天室
 export class ChatRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.ctx = state; // 用于 Hibernation API
+    this.ctx = state;
   }
 
   async fetch(request) {
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
-    // 为每个连接生成唯一 ID
     const clientId = crypto.randomUUID();
-
-    // 接受 WebSocket 连接，并附带 clientId 作为标签
     this.ctx.acceptWebSocket(server, [clientId]);
 
     return new Response(null, {
@@ -55,70 +44,84 @@ export class ChatRoom {
     });
   }
 
-  // 当 WebSocket 连接建立时触发（可选）
   async webSocketOpen(ws) {
     const clientId = this.ctx.getTags(ws)[0];
-    // 向该客户端发送欢迎消息（包含其 clientId）
-    ws.send(
-      JSON.stringify({
-        type: 'system',
-        content: `已连接至聊天室，你的 ID 是 ${clientId.slice(0, 6)}`,
-        clientId: clientId,
-        timestamp: Date.now(),
-      })
-    );
-
-    // 广播加入消息
-    const joinMsg = {
+    // 发送欢迎消息，包含 clientId
+    ws.send(JSON.stringify({
       type: 'system',
-      content: `用户 ${clientId.slice(0, 6)} 加入了房间`,
-      timestamp: Date.now(),
-    };
-    await this.broadcast(joinMsg);
+      content: `已连接，你的临时 ID: ${clientId.slice(0,6)}`,
+      clientId: clientId,
+      timestamp: Date.now()
+    }));
   }
 
-  // 收到客户端消息
   async webSocketMessage(ws, message) {
     const clientId = this.ctx.getTags(ws)[0];
-
     try {
       const data = JSON.parse(message);
+      
+      // 处理自定义用户名设置
+      if (data.type === 'set_username') {
+        // 存储用户名到连接元数据（可选，这里我们仅在消息中携带）
+        // 实际上可以直接在后续消息中包含 username
+        // 为了简单，让前端每次发送消息都带上 username
+        return;
+      }
+
       const payload = {
         type: data.type || 'message',
         clientId: clientId,
+        username: data.username || '匿名',
         content: data.content,
         timestamp: Date.now(),
       };
 
-      // 仅存储普通聊天消息（可选，用于历史记录）
+      // 存储聊天消息（可选）
       if (payload.type === 'message') {
         await this.state.storage.put(`msg:${payload.timestamp}`, payload);
       }
 
-      // 广播给所有连接的客户端
+      // 广播给所有连接
       await this.broadcast(payload);
     } catch (e) {
-      console.error('消息解析失败:', e);
+      console.error('消息处理错误:', e);
     }
   }
 
-  // 连接关闭
   async webSocketClose(ws, code, reason, wasClean) {
     const clientId = this.ctx.getTags(ws)[0];
+    
+    // 获取当前剩余连接数
+    const sockets = this.ctx.getWebSockets();
+    
+    // 广播离开消息（可选）
     const leaveMsg = {
       type: 'system',
-      content: `用户 ${clientId.slice(0, 6)} 离开了房间`,
-      timestamp: Date.now(),
+      content: `用户离开了房间`,
+      timestamp: Date.now()
     };
     await this.broadcast(leaveMsg);
+
+    // 如果没有连接了，延迟清理房间数据（防止立即有重连）
+    if (sockets.length === 0) {
+      // 设置一个 10 秒后触发的 alarm，用于清理存储
+      await this.state.storage.setAlarm(Date.now() + 10000);
+    }
   }
 
-  // 连接错误
   async webSocketError(ws, error) {
     console.error('WebSocket error:', error);
   }
 
-  // 广播辅助函数
+  // alarm 触发时清理房间数据
+  async alarm() {
+    const sockets = this.ctx.getWebSockets();
+    if (sockets.length === 0) {
+      // 删除所有存储数据
+      await this.state.storage.deleteAll();
+    }
+  }
+
   async broadcast(payload) {
     const sockets = this.ctx.getWebSockets();
     const messageStr = JSON.stringify(payload);
@@ -126,7 +129,7 @@ export class ChatRoom {
       try {
         socket.send(messageStr);
       } catch (e) {
-        // 发送失败（可能连接已断开），忽略
+        // ignore
       }
     }
   }
