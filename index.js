@@ -23,7 +23,7 @@ export default {
       return checkResult;
     }
 
-    // WebSocket 连接处理
+    // WebSocket 连接
     if (pathSegments.length >= 2 && pathSegments[0] === 'room') {
       const roomName = pathSegments[1];
 
@@ -49,11 +49,10 @@ export class ChatRoom {
     this.state = state;
     this.env = env;
     this.ctx = state;
-    this.sessions = new Map();        // clientId -> { ws, username, initialized }
+    this.sessions = new Map();        // clientId -> { ws, username, initialized, lastHeartbeat }
     this.usernames = new Set();
   }
 
-  // 处理来自 Worker 的 HTTP 请求（检查用户名）
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === '/check' && request.method === 'POST') {
@@ -70,7 +69,7 @@ export class ChatRoom {
       });
     }
 
-    // WebSocket 升级处理
+    // WebSocket 升级
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
     const clientId = crypto.randomUUID();
@@ -80,8 +79,9 @@ export class ChatRoom {
 
   async webSocketOpen(ws) {
     const clientId = this.ctx.getTags(ws)[0];
-    // 先创建一个未初始化的 session，等待 init 消息
-    this.sessions.set(clientId, { ws, username: null, initialized: false });
+    this.sessions.set(clientId, { ws, username: null, initialized: false, lastHeartbeat: Date.now() });
+    // 启动心跳检查 Alarm（如果尚未启动）
+    await this.ensureHeartbeatAlarm();
   }
 
   async webSocketMessage(ws, message) {
@@ -92,15 +92,17 @@ export class ChatRoom {
     try {
       const data = JSON.parse(message);
 
-      // 处理初始化消息
+      // 心跳消息
+      if (data.type === 'ping') {
+        session.lastHeartbeat = Date.now();
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+
+      // 初始化消息
       if (data.type === 'init') {
-        // 防止重复初始化
         if (session.initialized) {
-          ws.send(JSON.stringify({
-            type: 'error',
-            code: 'ALREADY_INIT',
-            message: '连接已初始化'
-          }));
+          ws.send(JSON.stringify({ type: 'error', code: 'ALREADY_INIT', message: '连接已初始化' }));
           return;
         }
 
@@ -108,56 +110,37 @@ export class ChatRoom {
         const nameRegex = /^[a-zA-Z0-9\u4e00-\u9fa5]{2,12}$/;
 
         if (!username || !nameRegex.test(username)) {
-          ws.send(JSON.stringify({
-            type: 'error',
-            code: 'INVALID_NAME',
-            message: '用户名必须为2-12位中英文或数字'
-          }));
+          ws.send(JSON.stringify({ type: 'error', code: 'INVALID_NAME', message: '用户名必须为2-12位中英文或数字' }));
           ws.close(1000, 'Invalid username');
           return;
         }
 
         if (this.usernames.has(username)) {
-          ws.send(JSON.stringify({
-            type: 'error',
-            code: 'DUPLICATE_NAME',
-            message: '用户名已被占用'
-          }));
+          ws.send(JSON.stringify({ type: 'error', code: 'DUPLICATE_NAME', message: '用户名已被占用' }));
           ws.close(1000, 'Duplicate username');
           return;
         }
 
-        // 更新 session 为已初始化
         session.username = username;
         session.initialized = true;
         this.usernames.add(username);
 
-        // 发送欢迎消息给该用户
-        ws.send(JSON.stringify({
-          type: 'system',
-          content: `🎉 欢迎 ${username} 加入房间`,
-          timestamp: Date.now()
-        }));
+        ws.send(JSON.stringify({ type: 'system', content: `🎉 欢迎 ${username} 加入房间`, timestamp: Date.now() }));
 
-        // 广播加入消息给其他人（排除自己）
         await this.broadcast({
           type: 'system',
           content: `👋 ${username} 加入了房间`,
           timestamp: Date.now()
         }, clientId);
 
-        await this.state.storage.deleteAlarm();
+        await this.state.storage.deleteAlarm(); // 房间有人，取消自动销毁 Alarm
         return;
       }
 
-      // 处理聊天消息（只有已初始化的会话才能发送）
+      // 聊天消息
       if (data.type === 'message') {
         if (!session.initialized) {
-          ws.send(JSON.stringify({
-            type: 'error',
-            code: 'NOT_INIT',
-            message: '请先设置用户名'
-          }));
+          ws.send(JSON.stringify({ type: 'error', code: 'NOT_INIT', message: '请先设置用户名' }));
           return;
         }
 
@@ -171,7 +154,6 @@ export class ChatRoom {
         };
 
         await this.state.storage.put(`msg:${payload.timestamp}`, payload);
-        // 广播给所有人（包括自己，前端会通过 tempId 去重）
         await this.broadcast(payload);
       }
     } catch (e) {
@@ -181,6 +163,16 @@ export class ChatRoom {
 
   async webSocketClose(ws, code, reason, wasClean) {
     const clientId = this.ctx.getTags(ws)[0];
+    await this.cleanupClient(clientId);
+  }
+
+  async webSocketError(ws, error) {
+    const clientId = this.ctx.getTags(ws)[0];
+    console.error('WebSocket error for', clientId, error);
+    await this.cleanupClient(clientId);
+  }
+
+  async cleanupClient(clientId) {
     const session = this.sessions.get(clientId);
     if (!session) return;
 
@@ -188,7 +180,6 @@ export class ChatRoom {
     this.sessions.delete(clientId);
     if (initialized && username) {
       this.usernames.delete(username);
-      // 广播离开消息
       await this.broadcast({
         type: 'system',
         content: `🚪 ${username} 离开了房间`,
@@ -196,19 +187,42 @@ export class ChatRoom {
       });
     }
 
+    // 如果房间空了，设置 30 秒后自动销毁
     if (this.sessions.size === 0) {
       await this.state.storage.setAlarm(Date.now() + 30000);
     }
   }
 
-  async webSocketError(ws, error) {
-    console.error('WebSocket error:', error);
+  // 心跳检查：清理超时连接（30 秒无心跳）
+  async ensureHeartbeatAlarm() {
+    // 每 30 秒执行一次清理
+    const existing = await this.state.storage.getAlarm();
+    if (!existing) {
+      await this.state.storage.setAlarm(Date.now() + 30000);
+    }
   }
 
   async alarm() {
+    const now = Date.now();
+    const timeout = 35000; // 35 秒无心跳视为断开
+
+    // 清理心跳超时的连接
+    for (const [clientId, session] of this.sessions.entries()) {
+      if (now - session.lastHeartbeat > timeout) {
+        try {
+          session.ws.close(1001, 'Heartbeat timeout');
+        } catch (e) {}
+        await this.cleanupClient(clientId);
+      }
+    }
+
     if (this.sessions.size === 0) {
+      // 房间无人，彻底销毁
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
+    } else {
+      // 仍有连接，继续下一次心跳检查
+      await this.state.storage.setAlarm(Date.now() + 30000);
     }
   }
 
@@ -216,12 +230,10 @@ export class ChatRoom {
     const messageStr = JSON.stringify(payload);
     for (const [cid, session] of this.sessions.entries()) {
       if (cid === excludeClientId) continue;
-      if (!session.initialized) continue; // 只发给已初始化的客户端
+      if (!session.initialized) continue;
       try {
         session.ws.send(messageStr);
-      } catch (e) {
-        // 忽略发送失败
-      }
+      } catch (e) {}
     }
   }
 }
