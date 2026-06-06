@@ -6,7 +6,6 @@ export default {
     const url = new URL(request.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
 
-    // CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -17,7 +16,7 @@ export default {
       });
     }
 
-    // 用户名检查 API：/check?room=xxx&username=yyy
+    // 用户名检查
     if (pathSegments.length === 1 && pathSegments[0] === 'check') {
       const room = url.searchParams.get('room');
       const username = url.searchParams.get('username');
@@ -40,7 +39,7 @@ export default {
       return response;
     }
 
-    // WebSocket 入口：/room/:name/ws（加上 /ws 更清晰）
+    // WebSocket 入口
     if (pathSegments.length >= 3 && pathSegments[0] === 'room' && pathSegments[2] === 'ws') {
       const roomName = pathSegments[1];
       const upgradeHeader = request.headers.get('Upgrade');
@@ -70,13 +69,12 @@ export default {
   },
 };
 
-// Durable Object：聊天房间
+// Durable Object
 export class ChatRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.sessions = new Map(); // 仅作辅助，真实连接以 ctx.getWebSockets() 为准
+    this.sessions = new Map();
 
-    // 从 Hibernation 恢复时，把已有的 WebSocket 重新放入 sessions
     this.ctx.getWebSockets().forEach((ws) => {
       const attachment = ws.deserializeAttachment();
       if (attachment && attachment.username) {
@@ -88,10 +86,8 @@ export class ChatRoom extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // 内部 HTTP 接口：用户名重复检查
     if (url.pathname === '/check' && request.method === 'POST') {
       const { username } = await request.json();
-
       let isTaken = false;
       for (const session of this.sessions.values()) {
         if (session.username === username) {
@@ -99,7 +95,6 @@ export class ChatRoom extends DurableObject {
           break;
         }
       }
-
       return new Response(JSON.stringify({ valid: !isTaken }), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -108,14 +103,11 @@ export class ChatRoom extends DurableObject {
     // WebSocket 升级
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
-
-    // 使用 Hibernation API 接受 WebSocket
     this.ctx.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketOpen(ws) {
-    // 初始状态，username 为 null，等待 init
     ws.serializeAttachment({ username: null });
     this.sessions.set(ws, { username: null });
   }
@@ -123,7 +115,6 @@ export class ChatRoom extends DurableObject {
   async webSocketMessage(ws, message) {
     let session = this.sessions.get(ws);
     if (!session) {
-      // 防御性：如果 Map 里没有，但 ws 在 ctx.getWebSockets() 中，重建 session
       const attachment = ws.deserializeAttachment() || {};
       session = { username: attachment.username || null };
       this.sessions.set(ws, session);
@@ -132,7 +123,13 @@ export class ChatRoom extends DurableObject {
     try {
       const data = JSON.parse(message);
 
-      // 初始化（设置用户名）
+      // 心跳包处理：收到 ping 回复 pong，保持连接活跃
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+
+      // 初始化
       if (data.type === 'init') {
         const username = data.username?.trim();
         const nameRegex = /^[a-zA-Z0-9\u4e00-\u9fa5]{2,12}$/;
@@ -147,7 +144,6 @@ export class ChatRoom extends DurableObject {
           return;
         }
 
-        // 再次检查重复
         let isTaken = false;
         for (const s of this.sessions.values()) {
           if (s.username === username) {
@@ -165,18 +161,15 @@ export class ChatRoom extends DurableObject {
           return;
         }
 
-        // 更新本地状态 & 附件
         session.username = username;
         ws.serializeAttachment({ username });
 
-        // 欢迎消息
         ws.send(JSON.stringify({
           type: 'system',
           content: `🎉 欢迎 ${username} 加入房间`,
           timestamp: Date.now(),
         }));
 
-        // 广播给其他人
         await this.broadcast(
           {
             type: 'system',
@@ -200,10 +193,9 @@ export class ChatRoom extends DurableObject {
           username: session.username,
           content: data.content,
           timestamp: Date.now(),
-          tempId: data.tempId, // 回传临时 ID，方便前端去重/替换
+          tempId: data.tempId,
         };
 
-        // 广播给所有人（包括自己）
         await this.broadcast(payload);
       }
     } catch (e) {
@@ -228,7 +220,6 @@ export class ChatRoom extends DurableObject {
     }
 
     this.sessions.delete(ws);
-    // Hibernation 场景下可不再调用 ws.close()，见官方说明
   }
 
   async webSocketError(ws, error) {
@@ -250,7 +241,6 @@ export class ChatRoom extends DurableObject {
     this.sessions.delete(ws);
   }
 
-  // 广播：优先使用 ctx.getWebSockets()，与 Hibernation 保持一致
   async broadcast(payload, excludeWs = null) {
     const messageStr = JSON.stringify(payload);
     const sockets = this.ctx.getWebSockets();
@@ -260,7 +250,6 @@ export class ChatRoom extends DurableObject {
       try {
         ws.send(messageStr);
       } catch (e) {
-        // 发送失败，可以记录日志；DO 会在 close/error 中清理
         console.error('广播发送失败:', e);
       }
     }
